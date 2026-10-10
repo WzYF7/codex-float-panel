@@ -138,6 +138,7 @@ class FloatNav:
         title.bind("<Button-1>", self._drag_start)
         title.bind("<B1-Motion>", self._drag_move)
 
+        self.pin_button = None
         for text, action in (("✕", self.root.destroy),
                              ("—", self.toggle_collapse),
                              ("📌", self.toggle_pin)):
@@ -145,8 +146,12 @@ class FloatNav:
                            font=("Segoe UI", 10), padx=self.px(6), cursor="hand2")
             btn.pack(side="right")
             btn.bind("<Button-1>", lambda _e, a=action: a())
-            btn.bind("<Enter>", lambda _e, w=btn: w.configure(fg=ACCENT))
-            btn.bind("<Leave>", lambda _e, w=btn: w.configure(fg=MUTED))
+            # 悬停只改背景色，避免盖掉钉子的"已置顶/未置顶"颜色状态
+            btn.bind("<Enter>", lambda _e, w=btn: w.configure(bg="#eef2ff"))
+            btn.bind("<Leave>", lambda _e, w=btn: w.configure(bg=BG))
+            if text == "📌":
+                self.pin_button = btn
+        self._sync_pin_button()
 
         tk.Frame(self.root, bg=LINE, height=self.px(1)).pack(fill="x")
 
@@ -260,7 +265,17 @@ class FloatNav:
             self._collapsed = True
 
     def toggle_pin(self):
-        self.root.attributes("-topmost", not bool(self.root.attributes("-topmost")))
+        """置顶开关：开启时始终浮在其他窗口之上。开=蓝色实心，关=灰色。"""
+        pinned = not bool(self.root.attributes("-topmost"))
+        self.root.attributes("-topmost", pinned)
+        self._sync_pin_button()
+        self.status.config(text="已置顶（始终在最前）" if pinned else "已取消置顶（可被其他窗口盖住）")
+
+    def _sync_pin_button(self):
+        if getattr(self, "pin_button", None) is None:
+            return
+        pinned = bool(self.root.attributes("-topmost"))
+        self.pin_button.configure(fg=ACCENT if pinned else "#c3c9d4")
 
     # ============================================================ 搜索框
     def _show_placeholder(self):
