@@ -80,14 +80,16 @@ pyinstaller --noconfirm --onefile --noconsole --name CodexFloat ^
 ## 目录结构
 
 ```
-src/float_nav.py    主程序（Tkinter 悬浮窗）
-src/nav_core.py     会话解析（JSONL → 轮次，含噪音过滤）
+src/float_nav.py    界面与交互（Tkinter 悬浮窗）
+src/nav_core.py     会话解析（JSONL → 轮次，带文件级缓存与噪音过滤）
+src/win_input.py    Windows 底层（窗口查找 + 键盘注入）
 src/icon.ico        图标（含多尺寸）
-build.bat          一键构建
+build.bat           一键构建
 ```
 
 ## License
 
 MIT
+
 
 

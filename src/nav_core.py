@@ -1,15 +1,29 @@
-#!/usr/bin/env python3
-# Codex 会话导航：核心解析模块
-import json, os, re
+"""Codex 会话解析：把 ~/.codex/sessions 里的 rollout JSONL 解析成"按轮次"的结构。
+
+对外只暴露三个东西：
+    collect()          -> {session_id: {id, cwd, files}}
+    load_turns(files)  -> [turn, ...]   每个 turn 含 user / asst / gist / lead
+    to_local(ts)       -> "10-10 12:34"
+
+设计要点：
+  · 文件级缓存：rollout 文件一旦解析过、且大小/修改时间没变，就直接复用结果
+  · 按需解析：先用字符串预筛 role，跳过 90% 以上的工具/思考/计费行，避免无谓的 json.loads
+  · 噪音过滤：Codex 会把"自动审查回放""审查结论 JSON"也写进会话，必须滤掉
+"""
+
+import json
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 
 HOME = Path(os.environ.get("USERPROFILE") or os.path.expanduser("~"))
-CODEX = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
-SESSIONS = CODEX / "sessions"
-ARCHIVED = CODEX / "archived_sessions"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
+SESSIONS = CODEX_HOME / "sessions"
+ARCHIVED = CODEX_HOME / "archived_sessions"
 
-BLOCKS = [
+# Codex 注入到用户消息里的环境块，展示时要剥掉
+_NOISE_BLOCKS = [
     r"<in-app-browser-context\b[^>]*>.*?</in-app-browser-context>",
     r"<environment_context\b[^>]*>.*?</environment_context>",
     r"<codex_apps_client_time_context\b[^>]*>.*?</codex_apps_client_time_context>",
@@ -20,35 +34,47 @@ BLOCKS = [
     r"<turn_aborted\b[^>]*>.*?</turn_aborted>",
     r"<turn_aborted\b[^>]*/?>",
 ]
-BLOCK_RE = [re.compile(p, re.S | re.I) for p in BLOCKS]
+_NOISE_RE = [re.compile(p, re.S | re.I) for p in _NOISE_BLOCKS]
+
+_FILE_CACHE = {}      # rollout 文件 -> (size, mtime, 消息列表)
+_HEAD_CACHE = {}      # rollout 文件首行 -> (size, mtime, 解析结果)
+
+
+# ---------------------------------------------------------------- 文本处理
 
 def clean(text):
+    """剥掉注入的环境块；若消息里有 `## My request:`，只保留它之后的内容。"""
     if not text:
         return ""
-    t = text
-    for r in BLOCK_RE:
-        t = r.sub(" ", t)
-    m = re.search(r"^#{1,6}\s*My request:\s*$", t, re.M)
-    if m:
-        t = t[m.end():]
-    t = re.sub(r"[ \t]+\n", "\n", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
+    out = text
+    for rx in _NOISE_RE:
+        out = rx.sub(" ", out)
+    marker = re.search(r"^#{1,6}\s*My request:\s*$", out, re.M)
+    if marker:
+        out = out[marker.end():]
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
 
 def gist(text, limit=64):
-    t = re.sub(r"\s+", " ", (text or "")).strip()
+    """列表里显示的一行摘要（取开头，去掉 markdown 记号）。"""
+    t = re.sub(r"\s+", " ", text or "").strip()
     t = re.sub(r"^[#*\->\s`]+", "", t)
     t = re.sub(r"^\d+[\.\)、]\s*", "", t)
     if not t:
         return "(空)"
     return t[:limit] + ("…" if len(t) > limit else "")
 
+
 def lead(text, limit=88):
-    t = re.sub(r"\s+", " ", (text or "")).strip()
+    """助手回复的首句（用于列表第二行）。"""
+    t = re.sub(r"\s+", " ", text or "").strip()
     if not t:
         return ""
     m = re.match(r"(.{8,%d}?[。！？.!?；;])" % limit, t)
     return (m.group(1) if m else t[:limit]).strip()
+
 
 def to_local(ts):
     try:
@@ -56,7 +82,9 @@ def to_local(ts):
     except Exception:
         return ""
 
+
 def is_junk(text):
+    """Codex 会把自动审查的输入/输出写进会话，这些不是真实对话。"""
     t = (text or "").strip()
     if not t:
         return True
@@ -70,7 +98,10 @@ def is_junk(text):
         return True
     return False
 
-def first_json(path):
+
+# ---------------------------------------------------------------- 会话扫描
+
+def _first_json(path):
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -85,149 +116,158 @@ def first_json(path):
         pass
     return None
 
-_HEAD_CACHE = {}
-
 
 def collect():
-    """扫描所有会话文件，按 session_id 归组。首行解析结果带缓存，轮询时只做 stat。"""
+    """扫描所有 rollout 文件，按 session_id 归组。首行解析带缓存，轮询时基本只做 stat。"""
     files = []
     if SESSIONS.exists():
         files += list(SESSIONS.rglob("rollout-*.jsonl"))
     if ARCHIVED.exists():
         files += list(ARCHIVED.rglob("*.jsonl"))
-    out = {}
-    for p in sorted(set(files)):
+
+    sessions = {}
+    for path in sorted(set(files)):
         try:
-            st = p.stat()
+            st = path.stat()
         except Exception:
             continue
-        key = str(p)
-        hit = _HEAD_CACHE.get(key)
-        if hit and hit[0] == st.st_size and hit[1] == st.st_mtime:
-            head = hit[2]
+        key = str(path)
+        cached = _HEAD_CACHE.get(key)
+        if cached and cached[0] == st.st_size and cached[1] == st.st_mtime:
+            head = cached[2]
         else:
-            head = first_json(p)
+            head = _first_json(path)
             _HEAD_CACHE[key] = (st.st_size, st.st_mtime, head)
         if not head:
             continue
-        pl = head.get("payload") or {}
-        sid = pl.get("session_id") or pl.get("id")
+
+        payload = head.get("payload") or {}
+        sid = payload.get("session_id") or payload.get("id")
         if not sid:
-            m = re.match(r"rollout-\d{4}-\d{2}-\d{2}T[\d\-]+-([0-9a-fA-F\-]{36})", p.name)
-            sid = m.group(1) if m else p.stem
-        it = out.setdefault(sid, {"id": sid, "cwd": "", "created": pl.get("timestamp", ""), "files": []})
-        it["files"].append(p)
-        if not it["cwd"] and pl.get("cwd"):
-            it["cwd"] = pl["cwd"]
-    return out
+            m = re.match(r"rollout-\d{4}-\d{2}-\d{2}T[\d\-]+-([0-9a-fA-F\-]{36})", path.name)
+            sid = m.group(1) if m else path.stem
+
+        item = sessions.setdefault(sid, {"id": sid, "cwd": "", "created": payload.get("timestamp", ""), "files": []})
+        item["files"].append(path)
+        if not item["cwd"] and payload.get("cwd"):
+            item["cwd"] = payload["cwd"]
+    return sessions
 
 
-_FILE_CACHE = {}
-_FILE_CACHE_MAX = 40
+# ---------------------------------------------------------------- 消息解析
 
-
-def _file_msgs(p):
-    """解析单个 rollout 文件；文件没变就复用上次结果（缓存）。"""
+def _parse_file(path):
+    """解析一个 rollout 文件里的 user/assistant 消息（带缓存）。"""
     try:
-        st = p.stat()
+        st = path.stat()
     except Exception:
         return []
-    key = str(p)
-    hit = _FILE_CACHE.get(key)
-    if hit and hit[0] == st.st_size and hit[1] == st.st_mtime:
-        return hit[2]
-    msgs = []
+    key = str(path)
+    cached = _FILE_CACHE.get(key)
+    if cached and cached[0] == st.st_size and cached[1] == st.st_mtime:
+        return cached[2]
+
+    messages = []
     try:
-        with p.open("r", encoding="utf-8", errors="replace") as f:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                # 快速预筛：工具调用/思考/计费这些行占 90% 以上，直接跳过不解析
+                # 预筛：只留可能含消息的行，其余（工具调用/思考/计费）不解析
                 if '"role":"user"' not in line and '"role":"assistant"' not in line:
                     continue
                 try:
-                    o = json.loads(line)
+                    obj = json.loads(line)
                 except Exception:
                     continue
-                if o.get("type") != "response_item":
+                if obj.get("type") != "response_item":
                     continue
-                pl = o.get("payload") or {}
-                if pl.get("type") != "message":
+                payload = obj.get("payload") or {}
+                if payload.get("type") != "message":
                     continue
-                role = pl.get("role")
+                role = payload.get("role")
                 if role not in ("user", "assistant"):
                     continue
-                text = "".join(c.get("text", "") for c in (pl.get("content") or []) if isinstance(c, dict))
+                text = "".join(c.get("text", "") for c in (payload.get("content") or []) if isinstance(c, dict))
                 if is_junk(text):
                     continue
-                meta = pl.get("internal_chat_message_metadata_passthrough") or {}
-                msgs.append({
-                    "ts": str(o.get("timestamp", "")),
+                meta = payload.get("internal_chat_message_metadata_passthrough") or {}
+                messages.append({
+                    "ts": str(obj.get("timestamp", "")),
                     "role": role,
                     "text": text,
                     "tid": meta.get("turn_id") or "",
-                    "phase": pl.get("phase") or "",
-                    "ord": o.get("ordinal") if isinstance(o.get("ordinal"), int) else 0,
+                    "phase": payload.get("phase") or "",
+                    "ord": obj.get("ordinal") if isinstance(obj.get("ordinal"), int) else 0,
                 })
     except Exception:
         pass
-    _FILE_CACHE[key] = (st.st_size, st.st_mtime, msgs)
-    if len(_FILE_CACHE) > _FILE_CACHE_MAX:
+
+    _FILE_CACHE[key] = (st.st_size, st.st_mtime, messages)
+    if len(_FILE_CACHE) > 40:              # 简单淘汰，避免长期占用内存
         for k in list(_FILE_CACHE)[:10]:
             _FILE_CACHE.pop(k, None)
-    return msgs
+    return messages
 
 
-def _msgs(files):
+def _all_messages(files):
+    messages = []
+    for path in files:
+        messages.extend(_parse_file(path))
+    messages.sort(key=lambda m: (m["ts"], 0 if m["role"] == "user" else 1, m["ord"]))
+    return messages
+
+
+def _merge_similar(turns):
+    """同一 turn_id 下 Codex 会把消息重发一次，去掉这种前缀重复。"""
     out = []
-    for p in files:
-        out.extend(_file_msgs(p))
-    out.sort(key=lambda m: (m["ts"], 0 if m["role"] == "user" else 1, m["ord"]))
+    for turn in turns:
+        cur = (turn.get("user") or "").strip()
+        if out:
+            prev = (out[-1].get("user") or "").strip()
+            if prev and cur and len(prev) >= 8 and (cur.startswith(prev) or prev.startswith(cur)):
+                if len(cur) > len(prev):
+                    out[-1] = turn
+                continue
+        out.append(turn)
     return out
 
 
 def load_turns(files):
-    turns, last_by_tid, cur = [], {}, None
-    for m in _msgs(files):
-        if m["role"] == "user":
-            body = clean(m["text"])
+    """把若干分片合并成按时间顺序的轮次列表。"""
+    turns, last_by_tid, current = [], {}, None
+
+    for msg in _all_messages(files):
+        if msg["role"] == "user":
+            body = clean(msg["text"])
             if not body:
                 continue
-            key = m["tid"] or ""
-            prev = last_by_tid.get(key) if key else None
+            tid = msg["tid"]
+            prev = last_by_tid.get(tid) if tid else None
             if prev is not None and clean(prev["raw"]) == body:
-                cur = prev
+                current = prev
                 continue
-            t = {"ts": m["ts"], "raw": m["text"], "asst": [], "tid": key}
-            turns.append(t)
-            if key:
-                last_by_tid[key] = t
-            cur = t
+            turn = {"ts": msg["ts"], "raw": msg["text"], "asst": [], "tid": tid}
+            turns.append(turn)
+            if tid:
+                last_by_tid[tid] = turn
+            current = turn
         else:
-            t = last_by_tid.get(m["tid"]) if m["tid"] else None
-            if t is None:
-                t = cur
-            if t is not None:
-                t["asst"].append({"text": m["text"], "phase": m["phase"]})
-    for t in turns:
-        t["user"] = clean(t["raw"])
-        t["gist"] = gist(t["user"])
+            turn = last_by_tid.get(msg["tid"]) if msg["tid"] else None
+            if turn is None:
+                turn = current
+            if turn is not None:
+                turn["asst"].append({"text": msg["text"], "phase": msg["phase"]})
+
+    for turn in turns:
+        turn["user"] = clean(turn["raw"])
+        turn["gist"] = gist(turn["user"])
         final = ""
-        for a in t["asst"]:
+        for a in turn["asst"]:
             if a["text"].strip() and a.get("phase") != "commentary":
                 final = a["text"]
         if not final:
-            for a in t["asst"]:
+            for a in turn["asst"]:
                 if a["text"].strip():
                     final = a["text"]
-        t["lead"] = lead(clean(final) if final else "")
-    turns = [t for t in turns if t["user"] or t["asst"]]
-    out = []
-    for t in turns:
-        b = (t.get("user") or "").strip()
-        if out:
-            a = (out[-1].get("user") or "").strip()
-            if a and b and len(a) >= 8 and (b.startswith(a) or a.startswith(b)) and not b.startswith("The following"):
-                if len(b) > len(a):
-                    out[-1] = t
-                continue
-        out.append(t)
-    return out
+        turn["lead"] = lead(clean(final) if final else "")
+
+    return _merge_similar([t for t in turns if t["user"] or t["asst"]])
