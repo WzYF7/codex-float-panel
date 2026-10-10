@@ -85,7 +85,11 @@ def first_json(path):
         pass
     return None
 
+_HEAD_CACHE = {}
+
+
 def collect():
+    """扫描所有会话文件，按 session_id 归组。首行解析结果带缓存，轮询时只做 stat。"""
     files = []
     if SESSIONS.exists():
         files += list(SESSIONS.rglob("rollout-*.jsonl"))
@@ -93,7 +97,17 @@ def collect():
         files += list(ARCHIVED.rglob("*.jsonl"))
     out = {}
     for p in sorted(set(files)):
-        head = first_json(p)
+        try:
+            st = p.stat()
+        except Exception:
+            continue
+        key = str(p)
+        hit = _HEAD_CACHE.get(key)
+        if hit and hit[0] == st.st_size and hit[1] == st.st_mtime:
+            head = hit[2]
+        else:
+            head = first_json(p)
+            _HEAD_CACHE[key] = (st.st_size, st.st_mtime, head)
         if not head:
             continue
         pl = head.get("payload") or {}
@@ -101,49 +115,74 @@ def collect():
         if not sid:
             m = re.match(r"rollout-\d{4}-\d{2}-\d{2}T[\d\-]+-([0-9a-fA-F\-]{36})", p.name)
             sid = m.group(1) if m else p.stem
-        s = out.setdefault(sid, {"id": sid, "cwd": "", "created": pl.get("timestamp", ""), "files": []})
-        s["files"].append(p)
-        if not s["cwd"] and pl.get("cwd"):
-            s["cwd"] = pl["cwd"]
+        it = out.setdefault(sid, {"id": sid, "cwd": "", "created": pl.get("timestamp", ""), "files": []})
+        it["files"].append(p)
+        if not it["cwd"] and pl.get("cwd"):
+            it["cwd"] = pl["cwd"]
     return out
 
-def _msgs(files):
+
+_FILE_CACHE = {}
+_FILE_CACHE_MAX = 40
+
+
+def _file_msgs(p):
+    """解析单个 rollout 文件；文件没变就复用上次结果（缓存）。"""
+    try:
+        st = p.stat()
+    except Exception:
+        return []
+    key = str(p)
+    hit = _FILE_CACHE.get(key)
+    if hit and hit[0] == st.st_size and hit[1] == st.st_mtime:
+        return hit[2]
     msgs = []
-    for p in files:
-        try:
-            with p.open("r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        o = json.loads(line)
-                    except Exception:
-                        continue
-                    if o.get("type") != "response_item":
-                        continue
-                    pl = o.get("payload") or {}
-                    if pl.get("type") != "message":
-                        continue
-                    role = pl.get("role")
-                    if role not in ("user", "assistant"):
-                        continue
-                    text = "".join(c.get("text", "") for c in (pl.get("content") or []) if isinstance(c, dict))
-                    if is_junk(text):
-                        continue
-                    meta = pl.get("internal_chat_message_metadata_passthrough") or {}
-                    msgs.append({
-                        "ts": str(o.get("timestamp", "")),
-                        "role": role,
-                        "text": text,
-                        "tid": meta.get("turn_id") or "",
-                        "phase": pl.get("phase") or "",
-                        "ord": o.get("ordinal") if isinstance(o.get("ordinal"), int) else 0,
-                    })
-        except Exception:
-            pass
-    msgs.sort(key=lambda m: (m["ts"], 0 if m["role"] == "user" else 1, m["ord"]))
+    try:
+        with p.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # 快速预筛：工具调用/思考/计费这些行占 90% 以上，直接跳过不解析
+                if '"role":"user"' not in line and '"role":"assistant"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") != "response_item":
+                    continue
+                pl = o.get("payload") or {}
+                if pl.get("type") != "message":
+                    continue
+                role = pl.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = "".join(c.get("text", "") for c in (pl.get("content") or []) if isinstance(c, dict))
+                if is_junk(text):
+                    continue
+                meta = pl.get("internal_chat_message_metadata_passthrough") or {}
+                msgs.append({
+                    "ts": str(o.get("timestamp", "")),
+                    "role": role,
+                    "text": text,
+                    "tid": meta.get("turn_id") or "",
+                    "phase": pl.get("phase") or "",
+                    "ord": o.get("ordinal") if isinstance(o.get("ordinal"), int) else 0,
+                })
+    except Exception:
+        pass
+    _FILE_CACHE[key] = (st.st_size, st.st_mtime, msgs)
+    if len(_FILE_CACHE) > _FILE_CACHE_MAX:
+        for k in list(_FILE_CACHE)[:10]:
+            _FILE_CACHE.pop(k, None)
     return msgs
+
+
+def _msgs(files):
+    out = []
+    for p in files:
+        out.extend(_file_msgs(p))
+    out.sort(key=lambda m: (m["ts"], 0 if m["role"] == "user" else 1, m["ord"]))
+    return out
+
 
 def load_turns(files):
     turns, last_by_tid, cur = [], {}, None

@@ -170,6 +170,8 @@ class FloatNav:
         self._msgq = queue.Queue()
         self._meta_cache, self._meta_ts, self._label_map = {}, 0, {}
         self._last_jump_ts = 0.0
+        self._hay_cache = None
+        self._rsig = None
         self._build()
         self.refresh(force=True)
         self.root.after(400, self.render)
@@ -415,17 +417,33 @@ class FloatNav:
         except Exception:
             return None
 
+    def _answer_full(self, t):
+        """该轮助手最终回复的纯文本（只算一次，缓存在轮次数据里）"""
+        v = t.get("_ansfull")
+        if v is None:
+            last = any_txt = ""
+            for a in t.get("asst", []):
+                if (a.get("text") or "").strip():
+                    any_txt = a["text"]
+                    if a.get("phase") != "commentary":
+                        last = a["text"]
+            v = self._plain(last or any_txt)
+            t["_ansfull"] = v
+        return v
+
+    def _uplain(self, t):
+        v = t.get("_uplain")
+        if v is None:
+            v = self._plain(t.get("user"))
+            t["_uplain"] = v
+        return v
+
     def _answer(self, t):
-        last = any_txt = ""
-        for a in t.get("asst", []):
-            if (a.get("text") or "").strip():
-                any_txt = a["text"]
-                if a.get("phase") != "commentary":
-                    last = a["text"]
-        txt = self._plain(last or any_txt)
+        txt = self._answer_full(t)
         if not txt:
             return ""
         return txt[:ANSWER_MAX] + ("\u2026" if len(txt) > ANSWER_MAX else "")
+
 
     def _short(self, t):
         g = (t.get("gist", "") or "").strip()
@@ -443,14 +461,26 @@ class FloatNav:
         return "%s · %s" % (name[:14], ts)
 
     def load(self, sid):
+        self._hay_cache = None
+        self._rsig = None
         self.current_sid = sid
         self.turns = nc.load_turns(self.sessions[sid]["files"])
         self.cur_sig = self._sig(sid)
         self.expanded = None
         self.render()
 
-    def render(self):
+    def render(self, force=False):
+        # 显示内容没变化就不重建 Text（几百轮时这一步很贵）
+        sig = (len(self.turns),
+               tuple(self._short(t) for t in self.turns),
+               tuple(self._answer(t) for t in self.turns),
+               tuple(sorted(self.marks.items())))
         q = "" if self._ph_on else self.search.get().strip().lower()
+        if not force and sig == getattr(self, "_rsig", None):
+            self.status.config(text="%d 轮%s · %s" % (
+                len(self.turns), (" 筛%d" % len(self.shown)) if q else "", time.strftime("%H:%M")))
+            return
+        self._rsig = sig
         self.txt.config(state="normal")
         self.txt.delete("1.0", "end")
         self.shown = []
@@ -520,21 +550,23 @@ class FloatNav:
         x = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", x)
         return self._norm(x)
 
+    def _hay(self):
+        """用于判重的文本：每轮只取前 160 字（足够，且不会把几 MB 拼成一个大字符串）"""
+        if getattr(self, "_hay_cache", None) is None:
+            parts = []
+            for t in self.turns:
+                parts.append(self._uplain(t)[:160] + " " + self._answer_full(t)[:160])
+            self._hay_cache = " ".join(parts)
+        return self._hay_cache
+
     def _search_key(self, idx):
-        hay = " ".join(self._plain((a.get("user") or "") + " " + " ".join(x.get("text", "") for x in a.get("asst", [])))
-                       for a in self.turns)
+        hay = self._hay()
         t = self.turns[idx]
         cands = []
-        u = self._plain(t.get("user"))
+        u = self._uplain(t)
         if u:
             cands.append(u)
-        last = any_txt = ""
-        for x in t.get("asst", []):
-            if (x.get("text") or "").strip():
-                any_txt = x["text"]
-                if x.get("phase") != "commentary":
-                    last = x["text"]
-        a = self._plain(last or any_txt)
+        a = self._answer_full(t)
         if a:
             cands.append(a)
         for base in cands:
@@ -545,6 +577,7 @@ class FloatNav:
                 if len(k) >= 4 and hay.count(k) == 1:
                     return k
         return None
+
 
     def _go_to(self, idx):
         if not self.turns or not (0 <= idx < len(self.turns)):
@@ -815,6 +848,9 @@ class FloatNav:
                 lab += "\u00b7"
             m[lab] = sid
             vals.append(lab)
+        if vals == getattr(self, "_combo_vals", None) and self.current_sid == getattr(self, "_combo_cur", None):
+            return                      # 内容没变就别重建下拉（几百个会话时很贵）
+        self._combo_vals, self._combo_cur = vals, self.current_sid
         self._label_map = m
         self.combo["values"] = vals
         if self.current_sid in self.sessions:
@@ -825,6 +861,7 @@ class FloatNav:
             s = nc.collect()
             self.sessions = s
             if self.current_sid in s and self._sig(self.current_sid) != self.cur_sig:
+                self._hay_cache = None
                 self.turns = nc.load_turns(s[self.current_sid]["files"])
                 self.cur_sig = self._sig(self.current_sid)
                 self.render()
