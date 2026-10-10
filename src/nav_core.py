@@ -4,7 +4,7 @@ import json, os, re
 from datetime import datetime
 from pathlib import Path
 
-HOME = Path(os.environ.get("USERPROFILE", r"C:\Users\1"))
+HOME = Path(os.environ.get("USERPROFILE") or os.path.expanduser("~"))
 CODEX = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 SESSIONS = CODEX / "sessions"
 ARCHIVED = CODEX / "archived_sessions"
